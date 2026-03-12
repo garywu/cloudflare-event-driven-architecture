@@ -50,6 +50,7 @@ This is a reference architecture for building event-driven systems on Cloudflare
 - [Agents as Event Reactors](#agents-as-event-reactors)
 - [Durable Workflows](#durable-workflows)
 - [The Event Catalog](#the-event-catalog)
+- [Small Patterns That Add Up](#small-patterns-that-add-up)
 - [What Not to Do](#what-not-to-do)
 - [What You Don't Need](#what-you-dont-need)
 - [Cloudflare Constraints](#cloudflare-constraints)
@@ -863,6 +864,421 @@ await env.RESEARCH_QUEUE.send(
 ```
 
 Type-safe. Auto-completed. If the schema changes, every consumer gets a compile error.
+
+---
+
+## Small Patterns That Add Up
+
+These are the building blocks. Each is small enough to drop into any Worker.
+
+### Delayed Retry with Backpressure
+
+When a downstream service is overloaded, don't hammer it. Delay the retry:
+
+```typescript
+async queue(batch: MessageBatch<DomainMessage>, env: Env): Promise<void> {
+  for (const msg of batch.messages) {
+    try {
+      await handleMessage(msg.body, env);
+      msg.ack();
+    } catch (err) {
+      if (err instanceof RateLimitError) {
+        // Back off — re-deliver in 60 seconds
+        msg.retry({ delaySeconds: 60 });
+      } else if (err instanceof TransientError) {
+        // Standard retry — re-deliver in 10 seconds
+        msg.retry({ delaySeconds: 10 });
+      } else {
+        // Permanent failure — let it DLQ after max retries
+        msg.retry();
+      }
+    }
+  }
+}
+```
+
+### Batch Sending
+
+Queues support `sendBatch` — send up to 100 messages in one call. Use this when generating many commands at once:
+
+```typescript
+// BrandAgent discovers 50 keywords, sends them all at once
+const messages = keywords.map((kw) => ({
+  body: createMessage("research.requested", "scalable-media", {
+    brand_slug: "niche-fi",
+    keywords: [kw],
+    priority: "normal",
+  }, correlationId),
+}));
+
+await env.RESEARCH_QUEUE.sendBatch(messages);
+```
+
+### Event Deduplication in Agents
+
+The Agent SDK's webhook guide recommends this pattern — track seen event IDs in the agent's SQLite:
+
+```typescript
+class BrandAgent extends Agent<Env, BrandState> {
+  private async isProcessed(eventId: string): Promise<boolean> {
+    const row = this.sql`
+      SELECT 1 FROM processed_events WHERE event_id = ${eventId}
+    `.toArray();
+    return row.length > 0;
+  }
+
+  private async markProcessed(eventId: string, type: string): Promise<void> {
+    this.sql`
+      INSERT INTO processed_events (event_id, type, processed_at)
+      VALUES (${eventId}, ${type}, ${new Date().toISOString()})
+    `;
+  }
+
+  async handleEvent(event: DomainMessage) {
+    if (await this.isProcessed(event.event_id)) return;
+    // ... handle the event ...
+    await this.markProcessed(event.event_id, event.type);
+  }
+}
+```
+
+### One Consumer, Multiple Queues
+
+A single Worker can consume from multiple queues. Use `batch.queue` to route:
+
+```typescript
+export default {
+  async queue(batch: MessageBatch<DomainMessage>, env: Env): Promise<void> {
+    switch (batch.queue) {
+      case "sm-commands":
+        await handleCommands(batch, env);
+        break;
+      case "sm-events":
+        await handleEvents(batch, env);
+        break;
+      case "sm-commands-dlq":
+        await handleDeadLetters(batch, env);
+        break;
+    }
+  },
+};
+```
+
+### Correlation ID Propagation
+
+Every command inherits the correlation ID from its triggering event. This lets you trace an entire cycle:
+
+```typescript
+// Event arrives: research.completed with correlation_id "cycle-niche-fi-1710..."
+async onResearchCompleted(event: DomainMessage<ResearchCompletedPayload>) {
+  // Commands inherit the correlation_id
+  await env.CONTENT_QUEUE.send(
+    createMessage("content.generate", "scalable-media", {
+      brand_slug: event.payload.brand_slug,
+      keyword: "best budgeting apps",
+      research_id: "r_001",
+      template: "pseo-article",
+    }, event.correlation_id) // ← passed through
+  );
+}
+
+// Later, in the DLQ handler, you can find every message in the chain:
+// SELECT * FROM processed_events WHERE correlation_id = 'cycle-niche-fi-1710...'
+```
+
+### Scheduled Agent Cycle
+
+An agent that wakes up on a cron, checks what needs doing, and emits commands:
+
+```typescript
+class BrandAgent extends Agent<Env, BrandState> {
+  // Called by this.schedule("0 */6 * * *", "cycle")
+  async cycle() {
+    const state = this.state;
+
+    // Check: do we need research?
+    if (this.daysSince(state.last_research_cycle) > 7) {
+      await this.requestResearch();
+    }
+
+    // Check: do we have unpublished content?
+    const unpublished = this.sql`
+      SELECT COUNT(*) as count FROM content WHERE published_at IS NULL
+    `.toArray();
+
+    if (unpublished[0].count > 0) {
+      await this.publishPending();
+    }
+
+    // Check: do we need performance review?
+    if (this.daysSince(state.last_performance_check) > 14) {
+      await this.requestPerformanceData();
+    }
+  }
+}
+```
+
+### Dead Letter Queue Monitor
+
+A simple DLQ consumer that logs failures and alerts:
+
+```typescript
+// dlq-monitor/src/index.ts
+export default {
+  async queue(batch: MessageBatch<DomainMessage>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      // Log the failure with full context
+      console.error(JSON.stringify({
+        level: "error",
+        message: "DLQ message received",
+        event_id: msg.body.event_id,
+        type: msg.body.type,
+        source: msg.body.source,
+        correlation_id: msg.body.correlation_id,
+        timestamp: msg.body.timestamp,
+        attempts: msg.attempts,
+      }));
+
+      // Store for investigation
+      await env.DB.prepare(
+        "INSERT INTO dlq_messages (event_id, type, source, payload, received_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(
+        msg.body.event_id,
+        msg.body.type,
+        msg.body.source,
+        JSON.stringify(msg.body.payload),
+        new Date().toISOString()
+      ).run();
+
+      msg.ack(); // Acknowledge so it doesn't loop
+    }
+  },
+};
+```
+
+### Read-Only Cross-Service Data Access
+
+Services can expose read-only HTTP APIs for data retrieval. This is the only permitted synchronous cross-service call:
+
+```typescript
+// GatherFeed exposes a read API — no auth needed for internal reads,
+// or use service binding for zero-network-hop access
+app.get("/api/v1/research/:id", async (c) => {
+  const research = await c.env.DB.prepare(
+    "SELECT * FROM research WHERE id = ?"
+  ).bind(c.req.param("id")).first();
+
+  if (!research) return c.json({ error: "not found" }, 404);
+  return c.json(research);
+});
+
+// BrandAgent reads GatherFeed's data when deciding what to generate
+// This is a query, not a command — it's fine to be synchronous
+async fetchResearchByIds(ids: string[]): Promise<Research[]> {
+  const results = await Promise.all(
+    ids.map((id) =>
+      fetch(`${this.env.GATHERFEED_URL}/api/v1/research/${id}`)
+        .then((r) => r.json())
+    )
+  );
+  return results;
+}
+```
+
+### Schema Migration for Event Tables
+
+Every service that consumes from queues needs these tables:
+
+```sql
+-- processed_events: idempotency tracking
+CREATE TABLE IF NOT EXISTS processed_events (
+  event_id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  processed_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_processed_events_at ON processed_events(processed_at);
+
+-- outbox: guaranteed event publication
+CREATE TABLE IF NOT EXISTS outbox (
+  event_id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  source TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  correlation_id TEXT,
+  created_at TEXT NOT NULL,
+  published_at TEXT
+);
+
+CREATE INDEX idx_outbox_unpublished ON outbox(published_at) WHERE published_at IS NULL;
+
+-- dlq_messages: dead letter queue investigation
+CREATE TABLE IF NOT EXISTS dlq_messages (
+  event_id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  source TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  investigated_at TEXT
+);
+```
+
+### Testing Queues Locally with Miniflare
+
+You can test queue producers and consumers locally without deploying:
+
+```typescript
+import { Miniflare } from "miniflare";
+
+const mf = new Miniflare({
+  workers: [
+    {
+      name: "producer",
+      modules: true,
+      script: `
+        export default {
+          async fetch(request, env) {
+            await env.QUEUE.send({ event_id: "test-1", type: "research.requested" });
+            return new Response("sent");
+          }
+        }
+      `,
+      queueProducers: { QUEUE: "research-commands" },
+    },
+    {
+      name: "consumer",
+      modules: true,
+      script: `
+        export default {
+          async queue(batch) {
+            for (const msg of batch.messages) {
+              console.log("received:", msg.body.type);
+              msg.ack();
+            }
+          }
+        }
+      `,
+      queueConsumers: { "research-commands": { maxBatchTimeout: 1 } },
+    },
+  ],
+});
+
+// Trigger the producer
+const resp = await mf.dispatchFetch("http://localhost");
+console.log(await resp.text()); // "sent"
+// Consumer logs: "received: research.requested"
+```
+
+### Workflow Progress to WebSocket Clients
+
+AgentWorkflow can broadcast progress to connected dashboard clients in real-time:
+
+```typescript
+class ContentWorkflow extends AgentWorkflow<BrandAgent, GenerateParams> {
+  async run(event: AgentWorkflowEvent<GenerateParams>, step: AgentWorkflowStep) {
+    // Non-durable: broadcasts to all WebSocket clients
+    this.broadcastToClients({
+      type: "workflow-started",
+      keyword: event.payload.keyword,
+    });
+
+    const outline = await step.do("outline", { /* ... */ }, async () => {
+      return await generateOutline(event.payload, this.env);
+    });
+
+    // Progress update — clients see this in real-time
+    this.reportProgress({ step: "outline", status: "complete", percent: 0.3 });
+
+    const draft = await step.do("draft", { /* ... */ }, async () => {
+      return await generateDraft(outline, this.env);
+    });
+
+    // Durable state update — persists AND broadcasts
+    await step.mergeAgentState({
+      currentWorkflow: { keyword: event.payload.keyword, step: "editorial", percent: 0.7 },
+    });
+
+    // ... continue ...
+  }
+}
+
+// Client-side React hook receives all updates automatically:
+// const agent = useAgent({ agent: "brand-agent", name: "niche-fi",
+//   onStateUpdate: (s) => setProgress(s.currentWorkflow)
+// });
+```
+
+### Conditional Fan-Out
+
+Route events based on payload content, not just event type:
+
+```typescript
+function getRoutes(event: DomainMessage): Queue[] {
+  const routes: Queue[] = [];
+
+  // Type-based routing
+  if (event.type === "research.completed") {
+    routes.push(env.SM_COMMANDS);
+  }
+
+  if (event.type === "content.published") {
+    routes.push(env.SM_COMMANDS);
+
+    // Only fan out to social if the brand has social enabled
+    if (event.payload.brand_slug !== "internal-tools") {
+      routes.push(env.SOCIAL_COMMANDS);
+    }
+
+    // Only fan out to analytics in production
+    if (env.ENVIRONMENT === "production") {
+      routes.push(env.ANALYTICS_QUEUE);
+    }
+  }
+
+  // Priority-based routing
+  if (event.payload.priority === "high") {
+    routes.push(env.ALERTS_QUEUE);
+  }
+
+  return routes;
+}
+```
+
+### Graceful Queue Consumer with Batch Acknowledgment
+
+Process a batch, acknowledge the good messages, retry the bad ones:
+
+```typescript
+async queue(batch: MessageBatch<DomainMessage>, env: Env): Promise<void> {
+  // Don't use batch.ackAll() or batch.retryAll()
+  // Handle each message individually for granularity
+
+  for (const msg of batch.messages) {
+    try {
+      await processMessage(msg.body, env);
+      msg.ack(); // This one is done
+    } catch (err) {
+      if (isRetryable(err)) {
+        msg.retry({ delaySeconds: computeBackoff(msg.attempts) });
+      } else {
+        // Log the permanent failure, ack so it goes to DLQ
+        console.error(`Permanent failure for ${msg.body.event_id}:`, err);
+        msg.ack(); // Will hit DLQ after max retries anyway
+      }
+    }
+  }
+}
+
+function computeBackoff(attempts: number): number {
+  // Exponential backoff: 5s, 10s, 20s, 40s, capped at 300s
+  return Math.min(5 * Math.pow(2, attempts), 300);
+}
+
+function isRetryable(err: unknown): boolean {
+  return err instanceof TransientError ||
+    (err instanceof Response && err.status >= 500);
+}
+```
 
 ---
 
