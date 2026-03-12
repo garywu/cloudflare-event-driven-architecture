@@ -54,6 +54,10 @@ This is a reference architecture for building event-driven systems on Cloudflare
 - [What Not to Do](#what-not-to-do)
 - [What You Don't Need](#what-you-dont-need)
 - [Cloudflare Constraints](#cloudflare-constraints)
+- [Compared: Message Queues](#compared-message-queues)
+- [Compared: Durable Execution](#compared-durable-execution)
+- [Compared: Stateful Compute](#compared-stateful-compute)
+- [Compared: Full Stack Architectures](#compared-full-stack-architectures)
 - [Full Example: Content Pipeline](#full-example-content-pipeline)
 - [References](#references)
 
@@ -1326,6 +1330,324 @@ Design around these. Don't fight them.
 
 ---
 
+## Compared: Message Queues
+
+Cloudflare Queues is one option among many. Here's how it stacks up against the alternatives — and when you'd pick each.
+
+### Cloudflare Queues vs AWS SQS
+
+SQS is the closest equivalent. Both are managed, serverless, point-to-point queues.
+
+| Dimension | Cloudflare Queues | AWS SQS |
+|-----------|------------------|---------|
+| **Delivery** | At-least-once | At-least-once (standard) or exactly-once (FIFO) |
+| **Ordering** | No guarantee | No guarantee (standard) or strict FIFO |
+| **Max message size** | 128 KB | 256 KB (up to 2 GB with S3 pointer) |
+| **Throughput** | 5,000 msg/sec/queue | Nearly unlimited (standard), 300 msg/sec (FIFO) |
+| **Consumers** | 1 per queue (up to 250 concurrent invocations) | Unlimited consumers polling |
+| **Dead letter queue** | Yes | Yes |
+| **Message delay** | Up to 24 hours | Up to 15 minutes |
+| **Retention** | Until consumed | Up to 14 days |
+| **Compute coupling** | Tightly coupled to Workers | Loosely coupled (Lambda, EC2, ECS, anything) |
+| **Egress fees** | None | Standard AWS egress |
+| **Fan-out** | Manual (JS routing in consumer) | Use SNS + SQS fan-out pattern |
+| **Pricing model** | Per message (simple) | Per request + data transfer |
+
+**When to pick SQS:** You need FIFO ordering, exactly-once delivery, longer retention, or your compute already lives on AWS.
+
+**When to pick CF Queues:** Your compute is on Cloudflare Workers. Zero egress fees. Simpler pricing. No separate fan-out service needed — JavaScript routing in the consumer handles it.
+
+### Cloudflare Queues vs AWS SNS + SQS
+
+AWS solves fan-out by pairing SNS (pub/sub) with SQS (queues). A producer publishes to an SNS topic, and multiple SQS queues subscribe.
+
+```
+AWS:    Producer → SNS Topic → SQS Queue A (Service A)
+                             → SQS Queue B (Service B)
+                             → SQS Queue C (Service C)
+
+CF:     Producer → Events Queue → Fan-out Consumer → Queue A (Service A)
+                                                   → Queue B (Service B)
+                                                   → Queue C (Service C)
+```
+
+| Dimension | SNS + SQS | CF Queues + Fan-out Consumer |
+|-----------|-----------|------------------------------|
+| **Fan-out mechanism** | Declarative: subscribe queues to topics | Programmable: JS code routes messages |
+| **Filtering** | SNS subscription filter policies (JSON) | Any JS logic (payload inspection, env vars, time-based) |
+| **Ordering** | SNS FIFO + SQS FIFO (same message group) | No ordering guarantee |
+| **Complexity** | Two services to configure, IAM policies | One extra Worker (the fan-out consumer) |
+| **Scalability** | SNS handles millions of subscribers | You manage the fan-out Worker's queue bindings |
+| **Content-based routing** | SNS filter policies (limited to message attributes) | Full JS — route on any field, any logic |
+
+**Pros of SNS+SQS:** Battle-tested at massive scale. Declarative subscriptions. FIFO support.
+
+**Pros of CF fan-out:** Programmable routing (not just attribute matching). No extra service to manage — it's just a Worker. No cross-service IAM configuration.
+
+### Cloudflare Queues vs AWS EventBridge
+
+EventBridge is AWS's serverless event bus — the closest analog to our "events queue + fan-out consumer" pattern, but fully managed.
+
+| Dimension | AWS EventBridge | CF Queues + Fan-out |
+|-----------|----------------|---------------------|
+| **Event routing** | Rules with 28+ filtering patterns | JavaScript (unlimited flexibility) |
+| **Schema registry** | Built-in (auto-discovers schemas) | Manual (TypeScript event catalog) |
+| **Targets** | 25+ AWS services directly | Only CF Queues (you wire the rest) |
+| **Cross-account** | Native cross-account event bus | Not applicable (single CF account) |
+| **Archive & replay** | Yes (replay events from archive) | No (consumed = gone) |
+| **Throughput** | Soft limits, request increases | 5,000 msg/sec per queue |
+| **Latency** | ~500ms typical | Sub-100ms (same CF network) |
+| **Pricing** | Per event ingested | Per message sent/received |
+
+**When EventBridge wins:** You need event archive/replay, schema discovery, or deep AWS service integration.
+
+**When CF wins:** You want sub-100ms latency between services on the same edge network. Your routing logic is complex enough that JSON filter patterns don't cut it.
+
+### Cloudflare Queues vs Apache Kafka
+
+Kafka is a different animal — a distributed commit log, not a message queue.
+
+| Dimension | Apache Kafka | Cloudflare Queues |
+|-----------|-------------|-------------------|
+| **Model** | Distributed commit log | Message queue |
+| **Ordering** | Guaranteed per partition | No guarantee |
+| **Delivery** | Exactly-once (with transactions) | At-least-once |
+| **Retention** | Configurable (days, weeks, forever) | Until consumed |
+| **Replay** | Yes — consumers can rewind to any offset | No |
+| **Consumer groups** | Multiple consumers per topic (consumer groups) | One consumer per queue |
+| **Throughput** | Millions of messages/sec | 5,000 msg/sec per queue |
+| **Operations** | Self-managed or Confluent Cloud ($$$) | Fully managed, zero ops |
+| **Schema** | Schema Registry (Avro, Protobuf, JSON Schema) | Manual (TypeScript types) |
+| **Latency** | Low (ms) | Low (ms, same network) |
+| **Cost** | Clusters + storage + egress | Per-message, no base cost |
+
+**When Kafka wins:** You need event replay (audit logs, rebuilding state), strict ordering, multiple independent consumers reading the same stream, or million-msg/sec throughput.
+
+**When CF Queues wins:** You don't need any of that. Most applications don't. If your throughput is under 50K msg/sec and you don't need replay, Kafka is massive overkill. CF Queues is zero-ops and costs pennies.
+
+### Cloudflare Queues vs Google Cloud Pub/Sub
+
+| Dimension | Google Cloud Pub/Sub | Cloudflare Queues |
+|-----------|---------------------|-------------------|
+| **Model** | Pub/Sub with subscriptions | Point-to-point queue |
+| **Fan-out** | Native: multiple subscriptions per topic | Manual: fan-out consumer |
+| **Ordering** | Supported (ordering keys) | No guarantee |
+| **Delivery** | At-least-once (exactly-once with ordering) | At-least-once |
+| **Dead letter** | Yes | Yes |
+| **Message size** | 10 MB | 128 KB |
+| **Retention** | Up to 31 days | Until consumed |
+| **Push/Pull** | Both | Both (Worker consumer or HTTP pull) |
+| **Global** | Multi-region by default | Global (Cloudflare network) |
+
+**When Pub/Sub wins:** Native fan-out without custom code. Larger messages. Longer retention. Deep GCP integration.
+
+**When CF Queues wins:** Tighter integration with Workers. No egress fees. Simpler pricing. Lower latency within the CF network.
+
+### Cloudflare Queues vs RabbitMQ
+
+| Dimension | RabbitMQ | Cloudflare Queues |
+|-----------|----------|-------------------|
+| **Model** | AMQP message broker | Managed queue |
+| **Routing** | Exchanges: direct, topic, fanout, headers | JavaScript consumer logic |
+| **Ordering** | Per-queue FIFO | No guarantee |
+| **Delivery** | At-least-once or at-most-once (configurable) | At-least-once |
+| **Operations** | Self-managed or CloudAMQP | Fully managed |
+| **Protocol** | AMQP, MQTT, STOMP | HTTP (producer), push (consumer) |
+| **Consumer model** | Pull (competing consumers) | Push (one consumer Worker, auto-scaled) |
+
+**When RabbitMQ wins:** You need complex routing topologies (exchanges + binding keys), multiple protocols, or priority queues.
+
+**When CF Queues wins:** You don't want to manage infrastructure. Your services are Workers. Simple is better.
+
+---
+
+## Compared: Durable Execution
+
+Multi-step workflows that survive failures. This is the domain of "durable execution" engines.
+
+### Cloudflare Workflows vs AWS Step Functions
+
+| Dimension | AWS Step Functions | Cloudflare Workflows |
+|-----------|-------------------|---------------------|
+| **Definition** | JSON (Amazon States Language) or visual designer | TypeScript code (`step.do()`) |
+| **Execution model** | State machine with transitions | Sequential code with durable checkpoints |
+| **Max duration** | 1 year (standard), 5 minutes (express) | Up to 1 year (`waitForEvent`) |
+| **Retry** | Per-state retry/catch policies | Per-step retry with backoff |
+| **Parallelism** | Parallel and Map states | `Promise.all()` across multiple `step.do()` |
+| **Human-in-the-loop** | Task tokens (callback pattern) | `waitForApproval()` |
+| **Observability** | Visual execution history, X-Ray | `reportProgress()`, lifecycle callbacks |
+| **Pricing** | Per state transition ($0.025/1K) | Per step (included in Workers pricing) |
+| **Compute coupling** | Lambda, ECS, any AWS service | Workers only |
+| **Agent integration** | No native equivalent | Native: AgentWorkflow ↔ Agent RPC |
+
+**Pros of Step Functions:** Visual designer. Deep AWS integration (invoke any service as a step). Mature ecosystem. Express Workflows for high-throughput, short-duration.
+
+**Pros of CF Workflows:** Code, not config. TypeScript all the way — no ASL to learn. Native agent integration (workflows can call agent methods, update agent state). Simpler pricing.
+
+**Key difference:** Step Functions are state machines defined in JSON. CF Workflows are sequential TypeScript with checkpoints. If you think in code, CF Workflows feel natural. If you think in diagrams, Step Functions have a visual editor.
+
+### Cloudflare Workflows vs Temporal
+
+| Dimension | Temporal | Cloudflare Workflows |
+|-----------|---------|---------------------|
+| **Language** | Go, Java, TypeScript, Python, .NET | TypeScript (Workers) |
+| **Infrastructure** | Self-hosted cluster or Temporal Cloud | Fully managed (zero ops) |
+| **Execution model** | Replay-based (deterministic re-execution) | Checkpoint-based (step results persisted) |
+| **Durability** | Infinite (workflow history is persistent) | Up to 1 year |
+| **Signals & queries** | First-class (signal a running workflow, query its state) | `sendEvent()`, `waitForApproval()` |
+| **Versioning** | Workflow versioning with `getVersion()` | No native versioning |
+| **Observability** | Temporal Web UI, workflow history explorer | Agent callbacks, `reportProgress()` |
+| **Community** | Large (Uber, Netflix, Snap, Stripe) | Growing (Cloudflare ecosystem) |
+| **Learning curve** | Steep (deterministic constraints, replay model) | Moderate (just `step.do()` in sequence) |
+
+**Pros of Temporal:** Battle-tested at enormous scale. Rich workflow primitives (signals, queries, child workflows, continue-as-new). Multi-language. Self-hostable. Large community.
+
+**Pros of CF Workflows:** Zero infrastructure. No cluster to manage. No replay model to understand — just write sequential code. Tight integration with Agents SDK for real-time state sync and WebSocket broadcasting.
+
+**Key difference:** Temporal uses replay-based durability — your workflow function is re-executed from the start, but completed activities return cached results. This is powerful but requires understanding deterministic constraints (no random, no Date.now() outside activities). CF Workflows uses checkpoint-based durability — step results are stored, and execution resumes from the last checkpoint. Simpler mental model, fewer gotchas.
+
+### Cloudflare Workflows vs Inngest
+
+| Dimension | Inngest | Cloudflare Workflows |
+|-----------|---------|---------------------|
+| **Model** | Event-driven step functions | Agent-integrated durable workflows |
+| **Trigger** | Events (any source via HTTP) | Agent `runWorkflow()` or manual |
+| **Steps** | `step.run()`, `step.sleep()`, `step.waitForEvent()` | `step.do()`, `step.sleep()`, `waitForApproval()` |
+| **Infrastructure** | Managed (SaaS) or self-hosted | Managed (Cloudflare) |
+| **Compute** | Your serverless functions (Lambda, Vercel, CF Workers) | Workers only |
+| **Fan-out** | Built-in (`step.sendEvent()`) | Manual (queue publish in step) |
+| **Concurrency control** | Built-in (per-function, per-key) | Manual |
+| **Pricing** | Per step execution | Included in Workers |
+
+**Pros of Inngest:** Platform-agnostic. Built-in concurrency control. Event-driven triggers from any source. Can invoke functions on any serverless platform.
+
+**Pros of CF Workflows:** No external dependency. Same-network execution (no HTTP hop to invoke). Agent state integration. Simpler if you're already on Cloudflare.
+
+### Cloudflare Workflows vs Restate
+
+[Restate](https://restate.dev/) is a newer durable execution engine that sits between Temporal's power and Inngest's simplicity.
+
+| Dimension | Restate | Cloudflare Workflows |
+|-----------|---------|---------------------|
+| **Model** | Durable async/await with journaling | Durable steps with checkpoints |
+| **Execution** | Proxied function calls (like Temporal, but lighter) | Sequential `step.do()` calls |
+| **State** | Built-in key-value state per handler | Agent SQLite + key-value state |
+| **Versioning** | First-class handler versioning | No native versioning |
+| **Infrastructure** | Restate Server (self-hosted or cloud) | Fully managed |
+| **Language** | TypeScript, Java, Kotlin, Go | TypeScript |
+
+**Pros of Restate:** Solves the immutability problem (handler versioning). Lighter than Temporal. Virtual objects (similar to Durable Objects).
+
+**Pros of CF Workflows:** No external server. Deeply integrated with the rest of the Cloudflare stack (Queues, D1, R2, Agents).
+
+---
+
+## Compared: Stateful Compute
+
+The BrandAgent pattern (persistent, stateful, addressable compute) has equivalents on other platforms.
+
+### Cloudflare Durable Objects / Agents SDK vs Azure Durable Entities
+
+| Dimension | Azure Durable Entities | CF Durable Objects / Agents SDK |
+|-----------|----------------------|--------------------------------|
+| **Model** | Entity functions (actor-like) | Durable Objects (actor model) |
+| **Storage** | Azure Table Storage (managed) | SQLite per object (co-located) |
+| **Addressing** | Entity ID | Object ID (name-based) |
+| **Communication** | Signals (one-way) or calls (request/response) | RPC, WebSocket, HTTP |
+| **Scheduling** | Durable timers | `this.schedule()` (cron or delay) |
+| **Real-time** | SignalR integration | Native WebSocket, state sync to clients |
+| **Colocation** | Compute and storage may be separate | Compute and storage in the same thread |
+
+**Key advantage of CF:** Storage is co-located with compute in the same thread. No network hop to read state. This is unique — on Azure, entity state is in Table Storage, which means a network round-trip on every read.
+
+### Cloudflare Durable Objects vs AWS DynamoDB + Lambda
+
+AWS doesn't have a direct equivalent to Durable Objects. The closest pattern is Lambda functions triggered by DynamoDB Streams:
+
+```
+CF:     Request → Worker → Durable Object (state + compute in one place)
+
+AWS:    Request → Lambda → DynamoDB (state)
+                         → DynamoDB Streams → Lambda (react to changes)
+```
+
+| Dimension | DynamoDB + Lambda | Cloudflare Durable Objects |
+|-----------|------------------|---------------------------|
+| **State access** | Network hop to DynamoDB | Same-thread SQLite (0ms) |
+| **Change events** | DynamoDB Streams → Lambda | Not built-in (use Queues or outbox) |
+| **Consistency** | Eventually consistent reads (strong optional) | Strongly consistent (single-threaded) |
+| **Addressing** | Partition key | Object name |
+| **Cost** | DynamoDB RCU/WCU + Lambda invocations | Durable Object requests + duration |
+| **Actor model** | No (you build it) | Yes (one instance per ID, serialized access) |
+
+**Pros of DynamoDB+Lambda:** Mature. Global tables. DynamoDB Streams for change data capture (CF has no equivalent of change feeds).
+
+**Pros of CF Durable Objects:** Single-threaded actor model eliminates concurrency bugs. Storage is in the same thread — no network hop. WebSocket support built-in. Agents SDK adds scheduling, workflows, and state sync for free.
+
+### Cloudflare Agents SDK vs Microsoft Orleans (Virtual Actors)
+
+The Agents SDK's actor-per-entity pattern is directly inspired by the virtual actor model that [Orleans](https://learn.microsoft.com/en-us/dotnet/orleans/) pioneered and [deco-cx/actors](https://github.com/deco-cx/actors) adapted for edge:
+
+| Dimension | Orleans | Cloudflare Agents SDK |
+|-----------|---------|----------------------|
+| **Language** | C# (.NET) | TypeScript |
+| **Runtime** | .NET cluster (self-hosted or Azure) | Cloudflare Workers (managed) |
+| **Actor lifecycle** | Virtual: activated on demand, deactivated on idle | Same: created on first access, hibernates |
+| **Persistence** | Pluggable (Azure Storage, SQL, etc.) | SQLite (co-located) |
+| **Streams** | Orleans Streams (pub/sub between actors) | No built-in inter-agent pub/sub (use Queues) |
+| **Timers/Reminders** | Built-in (survive restarts) | `this.schedule()` (survives restarts) |
+| **Reentrancy** | Configurable | Single-threaded (no reentrancy) |
+
+**Key insight:** Orleans invented the pattern. CF Agents SDK implements it on edge infrastructure. The mental model is the same — one actor per entity (one BrandAgent per brand), activated on demand, sleeps when idle, state persists across activations.
+
+---
+
+## Compared: Full Stack Architectures
+
+How does a full event-driven system on Cloudflare compare to equivalent architectures on other platforms?
+
+### Cloudflare Stack vs AWS Serverless Stack
+
+| Layer | Cloudflare | AWS |
+|-------|-----------|-----|
+| **Compute** | Workers | Lambda |
+| **Message queue** | Queues | SQS |
+| **Event bus** | Queues + fan-out consumer | EventBridge or SNS |
+| **Stateful compute** | Durable Objects / Agents SDK | Step Functions + DynamoDB (no direct equivalent) |
+| **Durable workflows** | Workflows / AgentWorkflow | Step Functions |
+| **Database** | D1 (SQLite) | DynamoDB or Aurora Serverless |
+| **Object storage** | R2 | S3 |
+| **Real-time** | WebSockets on Durable Objects | API Gateway WebSocket + Lambda |
+| **Scheduling** | Agent `this.schedule()` or Cron Triggers | EventBridge Scheduler |
+| **AI inference** | Workers AI | Bedrock |
+| **Observability** | Logpush, Workers Analytics | CloudWatch, X-Ray |
+
+**Pros of AWS:** Broader service catalog. More mature. Larger community. More third-party integrations. FIFO queues. Event replay (EventBridge Archive).
+
+**Pros of Cloudflare:** Radically simpler. Fewer services to wire together. Co-located compute+storage (Durable Objects). Zero egress fees. Sub-100ms global latency. One language (TypeScript) for everything. Agents SDK is a uniquely integrated offering — stateful compute + scheduling + workflows + WebSocket + SQLite in one class.
+
+**The honest trade-off:** AWS gives you more Lego bricks. Cloudflare gives you fewer bricks that fit together more tightly. If you need exactly the right brick (FIFO queues, event replay, cross-account event bus), AWS has it. If you want to build fast with less operational overhead, Cloudflare's integrated stack is hard to beat.
+
+### When to NOT Use the Cloudflare Stack
+
+Be honest about what it can't do:
+
+- **You need FIFO ordering.** CF Queues don't guarantee order. Period. If your domain requires strict ordering (financial transactions, ledger entries), use SQS FIFO or Kafka.
+- **You need event replay.** CF Queues are consume-and-forget. Kafka's commit log or EventBridge Archive let you rewind. If audit/compliance requires replaying the event stream, Cloudflare can't do it natively.
+- **You need multiple independent consumers per topic.** Kafka consumer groups let N consumers read the same topic independently. CF Queues requires the fan-out consumer pattern, which adds a hop and is less elegant at scale.
+- **Your team knows AWS.** Organizational momentum matters. If your team has years of AWS muscle memory, the productivity gain of Cloudflare's simpler model might not offset the learning curve.
+- **You need > 50K msg/sec sustained.** CF Queues does 5K/queue. You can shard across queues, but at some point you're fighting the platform. Kafka is built for this.
+- **You need global database transactions.** D1 is regional. DynamoDB Global Tables or CockroachDB handle multi-region writes. Durable Objects are globally addressable but single-homed.
+
+### When the Cloudflare Stack Shines
+
+- **Content platforms.** Read-heavy, write-light. D1 per-service. Workers at the edge. Durable Objects for personalization. This is the sweet spot.
+- **AI agent systems.** Agents SDK is purpose-built. Persistent state + scheduling + workflows + real-time WebSocket. No equivalent exists on AWS without stitching 4-5 services together.
+- **Multi-tenant SaaS.** Durable Objects as per-tenant state. D1 per-tenant databases. Workers for API layer. Natural isolation boundaries.
+- **Side projects and startups.** Zero base cost. Pay-per-use. No clusters to manage. Ship in a weekend.
+
+---
+
 ## Full Example: Content Pipeline
 
 Here's the complete flow — a BrandAgent wakes up, triggers research, reacts to results, generates content, and publishes. Every arrow is a queue message:
@@ -1402,6 +1724,19 @@ No service waited for another. GatherFeed could take 5 minutes or 5 hours. If st
 - [Dapr + Cloudflare Queues](https://github.com/diagrid-labs/dapr-cloudflare-queues) — event-driven reference with Dapr sidecar pattern
 - [durable-objects-channel](https://github.com/jw-12138/durable-objects-channel) — pub/sub module built on Durable Objects
 - [deco-cx/actors](https://github.com/deco-cx/actors) — Orleans-inspired virtual actors on Durable Objects and Deno
+
+### Comparisons and Analysis
+
+- [Durable Execution Showdown: AWS vs Temporal vs Cloudflare Workflows](https://medium.com/@rajaravivarman/durable-execution-showdown-aws-lambda-durable-functions-vs-temporal-vs-cloudflare-workflows-6a7785b851b4) — side-by-side comparison of durable execution engines
+- [The Rise of the Durable Execution Engine](https://www.kai-waehner.de/blog/2025/06/05/the-rise-of-the-durable-execution-engine-temporal-restate-in-an-event-driven-architecture-apache-kafka/) — Temporal and Restate in event-driven architectures
+- [The Emerging Landscape of Durable Computing](https://www.golem.cloud/post/the-emerging-landscape-of-durable-computing) — survey of durable execution platforms
+- [The Ultimate Guide to TypeScript Orchestration](https://medium.com/@matthieumordrel/the-ultimate-guide-to-typescript-orchestration-temporal-vs-trigger-dev-vs-inngest-and-beyond-29e1147c8f2d) — Temporal vs Trigger.dev vs Inngest
+- [Choosing Between SNS, SQS, and EventBridge](https://dev.to/aws-builders/event-driven-design-choosing-between-sns-sqs-and-eventbridge-i82) — AWS messaging service comparison
+- [AWS Decision Guide: SNS vs SQS vs EventBridge](https://docs.aws.amazon.com/decision-guides/latest/sns-or-sqs-or-eventbridge/sns-or-sqs-or-eventbridge.html) — official AWS guidance
+- [Edge Databases Compared](https://inventivehq.com/blog/cloudflare-d1-kv-vs-dynamodb-vs-cosmos-db-vs-firestore-edge-databases) — D1/KV/Durable Objects vs DynamoDB vs Cosmos DB vs Firestore
+- [Cloud Provider Comparison: Cloudflare vs AWS vs Azure vs GCP](https://inventivehq.com/blog/cloud-provider-comparison-guide-cloudflare-aws-azure-gcp) — full-stack platform comparison
+- [Restate: Solving Durable Execution's Immutability Problem](https://www.restate.dev/blog/solving-durable-executions-immutability-problem) — handler versioning approach
+- [Inngest vs Temporal](https://www.inngest.com/compare-to-temporal) — detailed feature comparison
 
 ### Architecture Patterns
 
